@@ -1,7 +1,9 @@
 ---
 name: build
 
-# Build and push ghcr.io/zerosignage/coreos-nvidia.
+# Build and push ghcr.io/zerosignage/coreos-nvidia + publish the
+# kmod-nvidia RPM (extracted from stage 1) and CycloneDX SBOM as
+# GitHub Release assets.
 #
 # Triggers:
 #   - push to main when build inputs change
@@ -28,7 +30,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write       # write needed to create/update GH Releases
       packages: write
     steps:
       - uses: actions/checkout@v5
@@ -41,6 +43,16 @@ jobs:
             /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
           df -h
 
+      - name: Compute short SHA + release tag
+        id: meta
+        # Short SHA in two forms: bare (7 chars) and prefixed `build-<sha>`
+        # for use as the GH Release tag (`build-` prefix avoids collision
+        # with any future semver tags).
+        run: |
+          short_sha=$(git rev-parse --short HEAD)
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
+          echo "release_tag=build-$short_sha" >> "$GITHUB_OUTPUT"
+
       - name: Login to GHCR
         uses: redhat-actions/podman-login@v1
         with:
@@ -48,7 +60,40 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build OCI image
+      # ── 1. Build only the kmod-builder stage. Produces a small
+      # intermediate image whose /home/builder/*.rpm is the kmod we
+      # want to publish. Cached on subsequent rebuilds of the same
+      # Containerfile.
+      - name: Build kmod-builder stage (for RPM extract)
+        id: build_kmod
+        uses: redhat-actions/buildah-build@v2
+        with:
+          image: coreos-nvidia-kmod
+          tags: stage1-${{ steps.meta.outputs.short_sha }}
+          containerfiles: ./Containerfile
+          oci: true
+          extra-args: |
+            --target kmod-builder
+            --device /dev/fuse
+            --security-opt label=disable
+
+      - name: Extract kmod RPM from kmod-builder image
+        id: extract
+        run: |
+          mkdir -p rpms
+          ctr=$(podman create localhost/coreos-nvidia-kmod:stage1-${{ steps.meta.outputs.short_sha }} true)
+          podman cp "$ctr:/home/builder/." ./rpms/
+          podman rm "$ctr" >/dev/null
+          # Move src.rpm separately just in case it's there
+          ls -la ./rpms/
+          # Capture filenames for the release body
+          {
+            echo "kmod_rpm=$(ls rpms/kmod-nvidia-*.rpm | head -1)"
+          } >> "$GITHUB_OUTPUT"
+
+      # ── 2. Build the FINAL image. The kmod-builder stage is cached
+      # from step 1, so this just runs stage 2 (FCOS host build).
+      - name: Build final FCOS image
         id: build
         uses: redhat-actions/buildah-build@v2
         with:
@@ -62,7 +107,7 @@ jobs:
             --device /dev/fuse
             --security-opt label=disable
 
-      - name: Push to GHCR
+      - name: Push image to GHCR
         id: push
         uses: redhat-actions/push-to-registry@v2
         with:
@@ -70,7 +115,54 @@ jobs:
           tags: ${{ steps.build.outputs.tags }}
           registry: ${{ env.REGISTRY }}/${{ github.repository_owner }}
 
-      - name: Image digest summary
+      # ── 3. Generate SBOM against the freshly-pushed image (so the
+      # SBOM tracks exactly what shipped to GHCR).
+      - name: Generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:stable-${{ github.sha }}
+          format: cyclonedx-json
+          output-file: sbom-coreos-nvidia-${{ steps.meta.outputs.short_sha }}.cdx.json
+          upload-artifact: true
+          upload-artifact-retention: 90
+
+      # ── 4. Publish kmod RPM + SBOM as a GitHub Release. Each build
+      # gets its own release tagged `build-<short-sha>`; the latest
+      # always becomes the implicit "latest" release.
+      - name: Create / update GitHub Release with RPM + SBOM
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.release_tag }}
+          name: "Build ${{ steps.meta.outputs.short_sha }}"
+          body: |
+            Automated build of `coreos-nvidia` from commit `${{ github.sha }}`.
+
+            ## Image
+            ```
+            ghcr.io/zerosignage/coreos-nvidia:stable-${{ github.sha }}
+            ghcr.io/zerosignage/coreos-nvidia:stable
+            ```
+
+            Digest: `${{ steps.push.outputs.digest }}`
+
+            ## Rebase command for target host
+            ```bash
+            sudo rpm-ostree rebase --bypass-driver \
+              ostree-unverified-registry:${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+            sudo systemctl reboot
+            ```
+
+            ## Artifacts
+            - `kmod-nvidia-*.rpm` — pre-compiled NVIDIA kernel module RPM, built against Fedora kernel `6.19.14-300.fc44.x86_64`. Install on a matching FCOS deployment via `rpm-ostree install kmod-nvidia-*.rpm` (note: requires the same kernel override as the full image; see README).
+            - `nvidia-kmod-*.src.rpm` — source RPM that was the input to the build (also extracted from stage 1).
+            - `sbom-coreos-nvidia-*.cdx.json` — CycloneDX SBOM of the final OCI image, for CRA compliance.
+          files: |
+            rpms/*.rpm
+            sbom-coreos-nvidia-${{ steps.meta.outputs.short_sha }}.cdx.json
+          prerelease: false
+          make_latest: true
+
+      - name: Build summary
         run: |
           {
             echo "## Image pushed"
@@ -79,7 +171,11 @@ jobs:
             echo
             echo "**Digest:** \`${{ steps.push.outputs.digest }}\`"
             echo
-            echo "### Rebase command for target host"
+            echo "## Release published"
+            echo
+            echo "https://github.com/${{ github.repository }}/releases/tag/${{ steps.meta.outputs.release_tag }}"
+            echo
+            echo "## Rebase command for target host"
             echo
             echo '```bash'
             echo "sudo rpm-ostree rebase --bypass-driver \\"
@@ -87,14 +183,3 @@ jobs:
             echo "sudo systemctl reboot"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-
-      # CRA-aligned SBOM, same pattern as build-roundcube-passwd-shim.yml
-      # in the platform repo. CycloneDX format, 90-day retention.
-      - name: Generate SBOM (CycloneDX)
-        uses: anchore/sbom-action@v0
-        with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:stable-${{ github.sha }}
-          format: cyclonedx-json
-          output-file: sbom-coreos-nvidia-${{ github.sha }}.cdx.json
-          upload-artifact: true
-          upload-artifact-retention: 90
