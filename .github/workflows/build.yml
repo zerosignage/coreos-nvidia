@@ -31,6 +31,11 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # OIDC token used by cosign for keyless signing via Fulcio.
+      # Sigstore exchanges this short-lived JWT for an X.509 cert
+      # bound to the workflow identity (repo + path + ref), then
+      # signs the image. No long-lived keys to manage or rotate.
+      id-token: write
     steps:
       - uses: actions/checkout@v5
 
@@ -71,22 +76,60 @@ jobs:
           tags: ${{ steps.build.outputs.tags }}
           registry: ${{ env.REGISTRY }}/${{ github.repository_owner }}
 
+      # ── Cosign keyless signing via GHA OIDC + Sigstore Fulcio.
+      # The signing identity bound into the cert is the GHA workflow
+      # path itself (subject: https://github.com/zerosignage/coreos-
+      # nvidia/.github/workflows/build.yml@refs/heads/main, issuer:
+      # https://token.actions.githubusercontent.com). Target hosts
+      # verify against that identity in their containers-policy.json
+      # rather than against a static public key.
+      #
+      # We sign the BY-DIGEST reference (not the floating :stable tag)
+      # so the signature is bound to specific image content. cosign
+      # stores the signature as a separate OCI artifact in the same
+      # registry path (suffix: .sig).
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image with cosign (keyless, Fulcio + Rekor)
+        env:
+          COSIGN_YES: "true"
+        run: |
+          cosign sign \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+
       - name: Image digest summary
         run: |
           {
-            echo "## Image pushed"
+            echo "## Image pushed and signed"
             echo
             echo "**Tags:** ${{ steps.push.outputs.registry-paths }}"
             echo
             echo "**Digest:** \`${{ steps.push.outputs.digest }}\`"
             echo
-            echo "### Rebase command for target host"
+            echo "**Signed by:** \`cosign\` keyless via Sigstore Fulcio (GHA OIDC)"
+            echo
+            echo "### Verify signature (any host with cosign):"
+            echo
+            echo '```bash'
+            echo "cosign verify \\"
+            echo "  --certificate-identity-regexp='^https://github.com/zerosignage/coreos-nvidia/\\.github/workflows/build\\.yml@' \\"
+            echo "  --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \\"
+            echo "  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}"
+            echo '```'
+            echo
+            echo "### Rebase command for target host (unverified — bootstrap only)"
             echo
             echo '```bash'
             echo "sudo rpm-ostree rebase --bypass-driver \\"
             echo "  ostree-unverified-registry:${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}"
             echo "sudo systemctl reboot"
             echo '```'
+            echo
+            echo "Once \`/etc/containers/policy.json\` is configured on the target"
+            echo "(see platform repo's coreos-nvidia-policy role — pending), use"
+            echo "\`ostree-image-signed:docker://...\` instead of \`ostree-unverified-registry:\`"
+            echo "to get cryptographic verification at rebase time."
           } >> "$GITHUB_STEP_SUMMARY"
 
       # CRA-aligned SBOM, same pattern as build-roundcube-passwd-shim.yml
