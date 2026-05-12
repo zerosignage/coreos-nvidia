@@ -1,0 +1,100 @@
+---
+name: build
+
+# Build and push ghcr.io/zerosignage/coreos-nvidia.
+#
+# Triggers:
+#   - push to main when build inputs change
+#   - weekly Monday 02:00 UTC (catch upstream FCOS / RPMFusion /
+#     NVIDIA driver bumps)
+#   - manual via workflow_dispatch
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Containerfile'
+      - 'systemd/**'
+      - '.github/workflows/build.yml'
+  schedule:
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/coreos-nvidia
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Maximize free disk space
+        # FCOS layers + akmodsbuild blow past the default GHA runner
+        # disk if we don't reclaim the preinstalled Android/.NET/etc.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      - name: Login to GHCR
+        uses: redhat-actions/podman-login@v1
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build OCI image
+        id: build
+        uses: redhat-actions/buildah-build@v2
+        with:
+          image: coreos-nvidia
+          tags: |
+            stable-${{ github.sha }}
+            stable
+          containerfiles: ./Containerfile
+          oci: true
+          extra-args: |
+            --device /dev/fuse
+            --security-opt label=disable
+
+      - name: Push to GHCR
+        id: push
+        uses: redhat-actions/push-to-registry@v2
+        with:
+          image: ${{ steps.build.outputs.image }}
+          tags: ${{ steps.build.outputs.tags }}
+          registry: ${{ env.REGISTRY }}/${{ github.repository_owner }}
+
+      - name: Image digest summary
+        run: |
+          {
+            echo "## Image pushed"
+            echo
+            echo "**Tags:** ${{ steps.push.outputs.registry-paths }}"
+            echo
+            echo "**Digest:** \`${{ steps.push.outputs.digest }}\`"
+            echo
+            echo "### Rebase command for target host"
+            echo
+            echo '```bash'
+            echo "sudo rpm-ostree rebase --bypass-driver \\"
+            echo "  ostree-unverified-registry:${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}"
+            echo "sudo systemctl reboot"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # CRA-aligned SBOM, same pattern as build-roundcube-passwd-shim.yml
+      # in the platform repo. CycloneDX format, 90-day retention.
+      - name: Generate SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:stable-${{ github.sha }}
+          format: cyclonedx-json
+          output-file: sbom-coreos-nvidia-${{ github.sha }}.cdx.json
+          upload-artifact: true
+          upload-artifact-retention: 90
