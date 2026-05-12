@@ -112,11 +112,22 @@ RUN ls /var/tmp/rpms/ && \
         python3-kubernetes \
         "https://github.com/k3s-io/k3s-selinux/releases/download/${K3S_SELINUX_TAG}/${K3S_SELINUX_RPM}"
 
+# Force-load NVIDIA kernel modules at boot via systemd-modules-load.
+# Without this, modules load lazily (first nvidia-smi call), which
+# races with zsig-nvidia-cdi.service's ConditionPathExists check.
+COPY modules-load.d/nvidia.conf /etc/modules-load.d/nvidia.conf
+
 # Boot-time CDI spec generator. Regenerates /etc/cdi/nvidia.yaml on
 # each boot so containers requesting `nvidia.com/gpu` see the right
 # device set.
 COPY systemd/zsig-nvidia-cdi.service /etc/systemd/system/
 RUN systemctl enable zsig-nvidia-cdi.service
+
+# Enable nvidia-persistenced (installed via xorg-x11-drv-nvidia-power's
+# deps). Keeps the GPU in persistent mode at boot — reduces cold-start
+# latency on first inference call after host idle, and ensures the
+# device nodes exist before any userspace tool tries to open them.
+RUN systemctl enable nvidia-persistenced.service
 
 # Smoke check + OSTree finalize.
 RUN echo "=== kernel modules in place ===" && \
