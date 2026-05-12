@@ -82,21 +82,24 @@ RUN echo "=== akmodsbuild head (BEFORE patch) ===" && \
     echo "=== grep EUID + root in akmodsbuild (BEFORE) ===" && \
     grep -nE 'EUID|Not to be used as root|exit 1' /usr/sbin/akmodsbuild || echo "(no matches)"
 
-# ── 3c. Replace the entire `if ... EUID ... ]]` line with `if false`.
-# Preserves bash syntax (the then-block becomes unreachable instead
-# of orphaned) and is robust to whitespace/operator variations in the
-# original check.
-RUN sed -i 's|^if \[\[.*EUID.*\]\]|if false # EUID root check disabled for CI build|' \
+# ── 3c. Patch the root check. The akmods 0.6.2 script doesn't use
+# $EUID — it uses `[[ -w /var ]]` as a proxy (only root can write to
+# /var on a normal Linux system, so writable /var == root). Replace
+# the condition with `[[ false ]]` so the if-body becomes unreachable
+# while preserving valid bash syntax. The "# CI" marker lets us
+# confirm the patch landed via the verification step below.
+RUN sed -i 's|if \[\[ -w /var \]\] ; then|if [[ false ]] ; then # CI: root-check disabled at image build|' \
         /usr/sbin/akmodsbuild
 
-# ── 3d. Verify the patch landed. If grep finds 0 matches, fail loud
-# so the operator sees it. The grep also surfaces the patched content
-# in the build log for confirmation.
-RUN echo "=== akmodsbuild head (AFTER patch) ===" && \
-    head -25 /usr/sbin/akmodsbuild && \
-    echo "=== grep 'disabled for CI' in akmodsbuild (AFTER) ===" && \
-    grep -n 'disabled for CI build' /usr/sbin/akmodsbuild || \
-        { echo "FATAL: sed patch did not match. EUID check is in a form the sed didn't anticipate."; exit 1; }
+# ── 3d. Verify the patch landed. The `if [[ false ]]` line should
+# now be present at the location where `-w /var` used to be. Fail
+# loud if not so a future operator sees a clear error instead of
+# the next step's confusing transaction error.
+RUN echo "=== akmodsbuild around the patch (AFTER) ===" && \
+    sed -n '30,45p' /usr/sbin/akmodsbuild && \
+    echo "=== grep 'CI: root-check disabled' (AFTER) ===" && \
+    grep -n 'CI: root-check disabled' /usr/sbin/akmodsbuild || \
+        { echo "FATAL: sed patch did not match. akmodsbuild's root check has changed format."; exit 1; }
 
 # ── 4. Layer the NVIDIA stack + k3s-selinux + ansible-side essentials.
 # akmod-nvidia's post-install scriptlet now succeeds because the
