@@ -1,50 +1,80 @@
-# Multi-stage build:
+# Three-stage build:
 #
-# Stage 1 ("kmod-builder"): regular Fedora 44 image. Install
-# akmods + kernel-devel + xorg-x11-drv-nvidia-kmodsrc, drop to a
-# non-root user, run akmodsbuild to produce kmod-nvidia.rpm. No
-# rpm-ostree involved — akmodsbuild's `-w /var` root check passes
-# false naturally for non-root.
+# Stage 0 ("fcos-base"): pull the FCOS base image just to read its
+# kernel-core NVR. The output (a single text file at /tmp/kernel-
+# uname-r) is COPY'd into stage 1 so the kmod is built against the
+# exact kernel FCOS already has — no hardcoded version that goes
+# stale every time FCOS rolls.
 #
-# Stage 2 (final image): FCOS. Override-replace kernel to match
-# what stage 1 built against, then `rpm-ostree install` the
-# kmod-nvidia RPM that stage 1 produced. No akmod build inside
-# FCOS, no transaction-reset issues.
+# Stage 1 ("kmod-builder"): regular Fedora 44 image. Reads the
+# kernel version from stage 0, installs akmods + kernel-devel +
+# xorg-x11-drv-nvidia-kmodsrc for that exact version, drops to a
+# non-root user, runs akmodsbuild to produce kmod-nvidia.rpm.
+# akmodsbuild's `[[ -w /var ]]` root-check passes false naturally
+# for non-root.
+#
+# Stage 2 (final image): FCOS. Installs the pre-built kmod-nvidia
+# RPM directly — NO `rpm-ostree override replace` because the kmod
+# was built against FCOS's actual kernel version. When FCOS rolls
+# forward, stage 0 picks up the new kernel-core NVR, the COPY into
+# stage 1 invalidates the build cache, and the kmod is rebuilt
+# automatically. No Containerfile edits needed across FCOS kernel
+# rolls — that's the whole point of this refactor. The 2026-05-12
+# build failure (FCOS shipped kernel 7.0.4 while this file hardcoded
+# 6.19.14) was the prompt for this redesign.
 
-# ── Stage 1: build kmod-nvidia RPM ─────────────────────────────
+# ── Stage 0: detect the FCOS base kernel ──────────────────────
+FROM quay.io/fedora/fedora-coreos:stable AS fcos-base
+
+# Emit just the NVR (e.g. "7.0.4-200.fc44.x86_64") to a file that
+# subsequent stages will COPY in. Trailing newline is OK; $(cat ...)
+# strips it via bash command-substitution semantics.
+RUN rpm -q kernel-core --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' \
+        > /tmp/kernel-uname-r && \
+    echo "FCOS base kernel: $(cat /tmp/kernel-uname-r)"
+
+# ── Stage 1: build kmod-nvidia RPM for that exact kernel ──────
 FROM fedora:44 AS kmod-builder
 
-ARG KERNEL_VERSION=6.19.14-300.fc44.x86_64
-ARG KERNEL_BASE_VERSION=6.19.14-300.fc44
+# Bring the kernel NVR over from stage 0. Owner=root, mode=0644 by
+# default — readable by the non-root 'builder' user we create below.
+COPY --from=fcos-base /tmp/kernel-uname-r /tmp/kernel-uname-r
 
-# RPMFusion for the nvidia kmod source RPM
+# RPMFusion repos for the nvidia kmod source RPM.
 RUN dnf install -y \
         https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-44.noarch.rpm \
         https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-44.noarch.rpm
 
-# Enable Fedora's updates-archive repo (not in the stock fedora:44
-# image). Needed because kernel-devel-6.19.14-300.fc44 has rolled
-# off updates into archive by now.
+# Enable Fedora's updates-archive repo. FCOS may track a kernel
+# currently in `updates` (fresh) OR one that's already rolled into
+# `updates-archive` (older). Enabling both ensures kernel-devel-
+# <whatever-FCOS-has> resolves regardless of where in Fedora's
+# lifecycle the kernel currently sits.
 RUN dnf install -y fedora-repos-archive
 
-# Build dependencies. kernel-devel pinned to the exact NVR we'll
-# build against, from the archive repo.
-RUN dnf install -y --enablerepo=updates-archive \
+# Build dependencies. kernel-devel pinned to the EXACT NVR FCOS
+# ships with — read at build time from the file COPY'd in above.
+# KVER_FULL: "7.0.4-200.fc44.x86_64" (uname -r format)
+# KVER_NVR:  "7.0.4-200.fc44"        (Name-Version-Release, used
+#                                     by the kernel-devel package suffix)
+RUN KVER_FULL=$(cat /tmp/kernel-uname-r) && \
+    KVER_NVR=${KVER_FULL%.x86_64} && \
+    echo "Building kmod-nvidia against kernel ${KVER_FULL}" && \
+    dnf install -y \
+        --enablerepo=updates-archive \
         akmods \
-        kernel-devel-${KERNEL_BASE_VERSION} \
+        kernel-devel-${KVER_NVR} \
         kernel-headers \
         xorg-x11-drv-nvidia-kmodsrc \
         gcc make rpm-build
 
 # Install akmod-nvidia for its source-rpm payload only. Its %post
 # would invoke akmods → akmodsbuild as root, which refuses. Skip
-# scriptlets with --setopt=tsflags=noscripts; we'll run akmodsbuild
+# scriptlets with --setopt=tsflags=noscripts; we run akmodsbuild
 # manually below as a non-root user.
-RUN dnf install -y --setopt=tsflags=noscripts \
-        akmod-nvidia
+RUN dnf install -y --setopt=tsflags=noscripts akmod-nvidia
 
-RUN echo "=== /usr/src/akmods/ contents ===" && \
-    ls -la /usr/src/akmods/
+RUN echo "=== /usr/src/akmods/ contents ===" && ls -la /usr/src/akmods/
 
 # Build as non-root (the simplest way to satisfy akmodsbuild's
 # `[[ -w /var ]]` check — unprivileged user lacks /var write
@@ -53,17 +83,17 @@ RUN useradd -m builder
 USER builder
 WORKDIR /home/builder
 
-RUN /usr/sbin/akmodsbuild --kernels ${KERNEL_VERSION} \
+# Build the kmod against the FCOS kernel version detected in stage 0.
+RUN KVER_FULL=$(cat /tmp/kernel-uname-r) && \
+    /usr/sbin/akmodsbuild --kernels ${KVER_FULL} \
         --outputdir /home/builder \
         /usr/src/akmods/nvidia-kmod-*.src.rpm
 
-# Inspect what we produced — surfaces in build log, helps debug
-# the depsolve issue we expect to hit in stage 2.
 RUN ls -la /home/builder/ && \
     echo "=== kmod-nvidia RPM requires ===" && \
     rpm -qpR /home/builder/kmod-nvidia-*.rpm
 
-# ── Stage 2: real FCOS image ───────────────────────────────────
+# ── Stage 2: real FCOS image ──────────────────────────────────
 FROM quay.io/fedora/fedora-coreos:stable
 
 ARG K3S_SELINUX_TAG=v1.6.stable.1
@@ -73,11 +103,12 @@ LABEL org.opencontainers.image.source="https://github.com/zerosignage/coreos-nvi
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 LABEL ostree.bootable="true"
 
-# Same kernel override as before — must match stage 1's KERNEL_VERSION.
-RUN rpm-ostree override replace \
-        --experimental \
-        --from repo=updates-archive \
-        kernel kernel-core kernel-modules kernel-modules-core
+# NOTE: NO `rpm-ostree override replace` step here. The kmod was
+# built against the exact kernel-core NVR FCOS already ships, so
+# there's no version mismatch to fix. When FCOS rolls forward,
+# stage 0 detects the new NVR, stage 1 rebuilds against it, stage
+# 2 (this stage) installs the new kmod against the matching kernel.
+# Self-correcting on FCOS roll-forwards.
 
 RUN rpm-ostree install \
         https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm \
@@ -98,12 +129,12 @@ RUN curl -fsSL -o /etc/pki/rpm-gpg/nvidia-container-toolkit.gpg \
 # Bring in the pre-built kmod RPM from stage 1.
 COPY --from=kmod-builder /home/builder/kmod-nvidia-*.rpm /var/tmp/rpms/
 
-# Install the kmod RPM (provides nvidia-kmod, satisfying the dep
-# from xorg-x11-drv-nvidia-cuda) + userspace driver + container
-# toolkit + k3s-selinux + ansible essentials. We deliberately do
-# NOT install akmod-nvidia here — the kmod RPM produced in stage 1
-# is sufficient and akmod-nvidia would only re-trigger the build
-# problems we just spent a whole afternoon designing around.
+# Install the kmod (provides nvidia-kmod, satisfying the dep from
+# xorg-x11-drv-nvidia-cuda) + userspace driver + container toolkit
+# + k3s-selinux + ansible essentials. We deliberately do NOT install
+# akmod-nvidia here — the kmod RPM produced in stage 1 is sufficient
+# and akmod-nvidia would only re-trigger the build problems we just
+# spent a whole afternoon designing around.
 RUN ls /var/tmp/rpms/ && \
     rpm-ostree install \
         /var/tmp/rpms/kmod-nvidia-*.rpm \
