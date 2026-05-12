@@ -15,6 +15,7 @@ on:
     paths:
       - 'Containerfile'
       - 'systemd/**'
+      - 'modules-load.d/**'
       - '.github/workflows/build.yml'
   schedule:
     - cron: '0 2 * * 1'
