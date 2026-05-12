@@ -66,9 +66,22 @@ RUN curl -fsSL -o /etc/pki/rpm-gpg/nvidia-container-toolkit.gpg \
     sed -i 's|^gpgkey=.*|gpgkey=file:///etc/pki/rpm-gpg/nvidia-container-toolkit.gpg|' \
         /etc/yum.repos.d/nvidia-container-toolkit.repo
 
-# ── 4. Layer the NVIDIA stack + k3s-selinux + ansible-side essentials
-# in one transaction so the depsolve happens once cleanly. akmod-nvidia
-# pulls in akmods, gcc, make, kernel-devel-matched as dependencies.
+# ── 3a. Pre-install akmods + patch its root check. akmod-nvidia's
+# post-install scriptlet invokes `akmodsbuild` to compile the kernel
+# module; `akmodsbuild` refuses to run as root for desktop-safety
+# reasons. In a Containerfile build we ARE root, with no clean way
+# to drop privileges from inside an rpm-ostree post-install hook,
+# so we neutralize the check: replace every `$EUID` reference with
+# `$NOT_CHECKING_ROOT_IN_CI_BUILDS`. The replacement variable is
+# undefined, Bash expands it to empty, the `[[ "" = "0" ]]` test
+# evaluates false, the build proceeds.
+RUN rpm-ostree install akmods && \
+    sed -i 's/\$EUID/\$NOT_CHECKING_ROOT_IN_CI_BUILDS/g' /usr/sbin/akmodsbuild && \
+    grep NOT_CHECKING_ROOT_IN_CI_BUILDS /usr/sbin/akmodsbuild | head -1
+
+# ── 4. Layer the NVIDIA stack + k3s-selinux + ansible-side essentials.
+# akmod-nvidia's post-install scriptlet now succeeds because the
+# previously-installed akmodsbuild has been patched in 3a.
 RUN rpm-ostree install \
         kernel-devel \
         akmod-nvidia \
