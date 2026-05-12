@@ -41,11 +41,30 @@ RUN rpm-ostree install \
         https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm \
         https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm
 
-# ── 3. NVIDIA-published container-toolkit repo. Not in RPMFusion;
-# only NVIDIA hosts it. Local repo file means no GPG-key fetch over
-# TLS at install time (which has its own intermittent failure modes).
-RUN curl -fsSL -o /etc/yum.repos.d/nvidia-container-toolkit.repo \
-        https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo
+# ── 2a. Fix the legacy CA-bundle symlink that FCOS 44 omits but
+# rpm-ostree's libcurl expects when it goes to fetch a repo's GPG key
+# over TLS. Without this, `rpm-ostree install` from any repo with a
+# remote `gpgkey=https://...` fails with curl error 77 ("CA cert
+# bundle access"), even though regular curl works fine. Same bug we
+# hit during r1's manual install dance. Also re-extract the trust
+# store so every consumer (java, openssl, pem) is consistent.
+RUN ln -sf /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
+           /etc/pki/tls/certs/ca-bundle.crt && \
+    update-ca-trust extract
+
+# ── 3. NVIDIA-published container-toolkit repo. We pre-download the
+# GPG key into the rpm keyring AND point the repo file at the local
+# copy of the key, so rpm-ostree never has to make a TLS roundtrip
+# for it. This avoids the "rpm-ostree can't open ca-bundle.crt"
+# class of failures even if upstream's TLS chain or our trust store
+# wobbles in the future.
+RUN curl -fsSL -o /etc/pki/rpm-gpg/nvidia-container-toolkit.gpg \
+        https://nvidia.github.io/libnvidia-container/gpgkey && \
+    rpm --import /etc/pki/rpm-gpg/nvidia-container-toolkit.gpg && \
+    curl -fsSL -o /etc/yum.repos.d/nvidia-container-toolkit.repo \
+        https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo && \
+    sed -i 's|^gpgkey=.*|gpgkey=file:///etc/pki/rpm-gpg/nvidia-container-toolkit.gpg|' \
+        /etc/yum.repos.d/nvidia-container-toolkit.repo
 
 # ── 4. Layer the NVIDIA stack + k3s-selinux + ansible-side essentials
 # in one transaction so the depsolve happens once cleanly. akmod-nvidia
