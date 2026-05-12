@@ -1,63 +1,92 @@
-# syntax=docker/dockerfile:1.6
+# Multi-stage build:
 #
-# Custom Fedora CoreOS + NVIDIA proprietary driver OCI image, built for
-# zerosignage on-prem GPU hosts (currently: r1.0cs.lan, RTX 3090 Ti).
+# Stage 1 ("kmod-builder"): regular Fedora 44 image. Install
+# akmods + kernel-devel + xorg-x11-drv-nvidia-kmodsrc, drop to a
+# non-root user, run akmodsbuild to produce kmod-nvidia.rpm. No
+# rpm-ostree involved — akmodsbuild's `-w /var` root check passes
+# false naturally for non-root.
 #
-# The kernel-devel-matching dance that bites everyone hand-installing
-# akmod-nvidia on FCOS (FCOS ships a `-101.fc44` kernel respin for
-# which no public kernel-devel matches) is resolved here, once, at
-# image-build time: we override-replace FCOS's kernel package set
-# with Fedora's standard `-300.fc44` build of the same upstream
-# version. Then akmod-nvidia resolves cleanly, and we precompile the
-# kernel module so the image ships with it baked in. Target hosts
-# boot straight into a working driver.
-#
-# Output: OSTree-aware OCI image at ghcr.io/zerosignage/coreos-nvidia.
-# Consume via: rpm-ostree rebase ostree-unverified-registry:<path>:stable
+# Stage 2 (final image): FCOS. Override-replace kernel to match
+# what stage 1 built against, then `rpm-ostree install` the
+# kmod-nvidia RPM that stage 1 produced. No akmod build inside
+# FCOS, no transaction-reset issues.
 
+# ── Stage 1: build kmod-nvidia RPM ─────────────────────────────
+FROM fedora:44 AS kmod-builder
+
+ARG KERNEL_VERSION=6.19.14-300.fc44.x86_64
+ARG KERNEL_BASE_VERSION=6.19.14-300.fc44
+
+# RPMFusion for the nvidia kmod source RPM
+RUN dnf install -y \
+        https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-44.noarch.rpm \
+        https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-44.noarch.rpm
+
+# Enable Fedora's updates-archive repo (not in the stock fedora:44
+# image). Needed because kernel-devel-6.19.14-300.fc44 has rolled
+# off updates into archive by now.
+RUN dnf install -y fedora-repos-archive
+
+# Build dependencies. kernel-devel pinned to the exact NVR we'll
+# build against, from the archive repo.
+RUN dnf install -y --enablerepo=updates-archive \
+        akmods \
+        kernel-devel-${KERNEL_BASE_VERSION} \
+        kernel-headers \
+        xorg-x11-drv-nvidia-kmodsrc \
+        gcc make rpm-build
+
+# Install akmod-nvidia for its source-rpm payload only. Its %post
+# would invoke akmods → akmodsbuild as root, which refuses. Skip
+# scriptlets with --setopt=tsflags=noscripts; we'll run akmodsbuild
+# manually below as a non-root user.
+RUN dnf install -y --setopt=tsflags=noscripts \
+        akmod-nvidia
+
+RUN echo "=== /usr/src/akmods/ contents ===" && \
+    ls -la /usr/src/akmods/
+
+# Build as non-root (the simplest way to satisfy akmodsbuild's
+# `[[ -w /var ]]` check — unprivileged user lacks /var write
+# permission, the check evaluates false, the build proceeds).
+RUN useradd -m builder
+USER builder
+WORKDIR /home/builder
+
+RUN /usr/sbin/akmodsbuild --kernels ${KERNEL_VERSION} \
+        --outputdir /home/builder \
+        /usr/src/akmods/nvidia-kmod-*.src.rpm
+
+# Inspect what we produced — surfaces in build log, helps debug
+# the depsolve issue we expect to hit in stage 2.
+RUN ls -la /home/builder/ && \
+    echo "=== kmod-nvidia RPM requires ===" && \
+    rpm -qpR /home/builder/kmod-nvidia-*.rpm
+
+# ── Stage 2: real FCOS image ───────────────────────────────────
 FROM quay.io/fedora/fedora-coreos:stable
 
 ARG K3S_SELINUX_TAG=v1.6.stable.1
 ARG K3S_SELINUX_RPM=k3s-selinux-1.6-1.coreos.noarch.rpm
 
 LABEL org.opencontainers.image.source="https://github.com/zerosignage/coreos-nvidia"
-LABEL org.opencontainers.image.description="Fedora CoreOS + NVIDIA proprietary driver + nvidia-container-toolkit + k3s-selinux, ready for k3s GPU workloads"
 LABEL org.opencontainers.image.licenses="Apache-2.0"
 LABEL ostree.bootable="true"
 
-# ── 1. Replace the FCOS kernel respin (-101) with Fedora's matching
-# `-300.fc44` upstream build so akmod-nvidia's build dependency on
-# kernel-devel-matched is satisfiable. We pull from updates-archive
-# rather than updates because the matching -300 build often lands in
-# archive before akmod-nvidia in nonfree-updates catches up.
+# Same kernel override as before — must match stage 1's KERNEL_VERSION.
 RUN rpm-ostree override replace \
         --experimental \
         --from repo=updates-archive \
         kernel kernel-core kernel-modules kernel-modules-core
 
-# ── 2. RPMFusion (free + nonfree) provides akmod-nvidia + the matching
-# CUDA userspace driver packages.
 RUN rpm-ostree install \
         https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm \
         https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm
 
-# ── 2a. Fix the legacy CA-bundle symlink that FCOS 44 omits but
-# rpm-ostree's libcurl expects when it goes to fetch a repo's GPG key
-# over TLS. Without this, `rpm-ostree install` from any repo with a
-# remote `gpgkey=https://...` fails with curl error 77 ("CA cert
-# bundle access"), even though regular curl works fine. Same bug we
-# hit during r1's manual install dance. Also re-extract the trust
-# store so every consumer (java, openssl, pem) is consistent.
 RUN ln -sf /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
            /etc/pki/tls/certs/ca-bundle.crt && \
     update-ca-trust extract
 
-# ── 3. NVIDIA-published container-toolkit repo. We pre-download the
-# GPG key into the rpm keyring AND point the repo file at the local
-# copy of the key, so rpm-ostree never has to make a TLS roundtrip
-# for it. This avoids the "rpm-ostree can't open ca-bundle.crt"
-# class of failures even if upstream's TLS chain or our trust store
-# wobbles in the future.
 RUN curl -fsSL -o /etc/pki/rpm-gpg/nvidia-container-toolkit.gpg \
         https://nvidia.github.io/libnvidia-container/gpgkey && \
     rpm --import /etc/pki/rpm-gpg/nvidia-container-toolkit.gpg && \
@@ -66,68 +95,34 @@ RUN curl -fsSL -o /etc/pki/rpm-gpg/nvidia-container-toolkit.gpg \
     sed -i 's|^gpgkey=.*|gpgkey=file:///etc/pki/rpm-gpg/nvidia-container-toolkit.gpg|' \
         /etc/yum.repos.d/nvidia-container-toolkit.repo
 
-# ── 3a. Pre-install akmods. akmod-nvidia's post-install scriptlet
-# invokes `akmodsbuild` to compile the kernel module; `akmodsbuild`
-# refuses to run as root for desktop-safety reasons. In a Containerfile
-# build we ARE root with no clean privilege-drop path. Installing akmods
-# alone (no kmod source yet) doesn't trigger any build, but does place
-# /usr/sbin/akmodsbuild on disk for the next step to patch.
-RUN rpm-ostree install akmods
+# Bring in the pre-built kmod RPM from stage 1.
+COPY --from=kmod-builder /home/builder/kmod-nvidia-*.rpm /var/tmp/rpms/
 
-# ── 3b. Print akmodsbuild's pre-patch content so we can see what the
-# root check actually looks like in the version we got. Surfaces in
-# the GHA log for forensics.
-RUN echo "=== akmodsbuild head (BEFORE patch) ===" && \
-    head -25 /usr/sbin/akmodsbuild && \
-    echo "=== grep EUID + root in akmodsbuild (BEFORE) ===" && \
-    grep -nE 'EUID|Not to be used as root|exit 1' /usr/sbin/akmodsbuild || echo "(no matches)"
-
-# ── 3c. Patch the root check. The akmods 0.6.2 script doesn't use
-# $EUID — it uses `[[ -w /var ]]` as a proxy (only root can write to
-# /var on a normal Linux system, so writable /var == root). Replace
-# the condition with `[[ false ]]` so the if-body becomes unreachable
-# while preserving valid bash syntax. The "# CI" marker lets us
-# confirm the patch landed via the verification step below.
-RUN sed -i 's|if \[\[ -w /var \]\] ; then|if [[ false ]] ; then # CI: root-check disabled at image build|' \
-        /usr/sbin/akmodsbuild
-
-# ── 3d. Verify the patch landed. The `if [[ false ]]` line should
-# now be present at the location where `-w /var` used to be. Fail
-# loud if not so a future operator sees a clear error instead of
-# the next step's confusing transaction error.
-RUN echo "=== akmodsbuild around the patch (AFTER) ===" && \
-    sed -n '30,45p' /usr/sbin/akmodsbuild && \
-    echo "=== grep 'CI: root-check disabled' (AFTER) ===" && \
-    grep -n 'CI: root-check disabled' /usr/sbin/akmodsbuild || \
-        { echo "FATAL: sed patch did not match. akmodsbuild's root check has changed format."; exit 1; }
-
-# ── 4. Layer the NVIDIA stack + k3s-selinux + ansible-side essentials.
-# akmod-nvidia's post-install scriptlet now succeeds because the
-# previously-installed akmodsbuild has been patched in 3a.
-RUN rpm-ostree install \
-        kernel-devel \
-        akmod-nvidia \
+# Install the kmod RPM (provides nvidia-kmod, satisfying the dep
+# from xorg-x11-drv-nvidia-cuda) + userspace driver + container
+# toolkit + k3s-selinux + ansible essentials. We deliberately do
+# NOT install akmod-nvidia here — the kmod RPM produced in stage 1
+# is sufficient and akmod-nvidia would only re-trigger the build
+# problems we just spent a whole afternoon designing around.
+RUN ls /var/tmp/rpms/ && \
+    rpm-ostree install \
+        /var/tmp/rpms/kmod-nvidia-*.rpm \
         xorg-x11-drv-nvidia-cuda \
         nvidia-container-toolkit \
         python3-kubernetes \
         "https://github.com/k3s-io/k3s-selinux/releases/download/${K3S_SELINUX_TAG}/${K3S_SELINUX_RPM}"
 
-# ── 5. Pre-build the NVIDIA kernel module against the (now-matched)
-# kernel-devel. Without this, akmods would run on first boot of the
-# target host — which is the exact fragility we are trying to avoid.
-# After this RUN, `/lib/modules/<kver>/extra/nvidia/` is populated.
-RUN KVER=$(rpm -q kernel-core --queryformat '%{VERSION}-%{RELEASE}.%{ARCH}\n' | head -1) && \
-    akmods --force --kernels "$KVER" && \
-    depmod -a "$KVER"
-
-# ── 6. Boot-time CDI spec generator. Containers requesting GPUs via
-# `nvidia.com/gpu=all` or `runtimeClassName: nvidia` read the spec
-# from /etc/cdi/nvidia.yaml; we regenerate it on every boot so the
-# spec always matches the running driver version.
+# Boot-time CDI spec generator. Regenerates /etc/cdi/nvidia.yaml on
+# each boot so containers requesting `nvidia.com/gpu` see the right
+# device set.
 COPY systemd/zsig-nvidia-cdi.service /etc/systemd/system/
 RUN systemctl enable zsig-nvidia-cdi.service
 
-# ── 7. Finalize as an OSTree commit. Without this step the image
-# is a plain OCI image, not rebaseable via rpm-ostree.
+# Smoke check + OSTree finalize.
+RUN echo "=== kernel modules in place ===" && \
+    ls /lib/modules/*/extra/nvidia/ | head -5 && \
+    echo "=== nvidia userspace tools ===" && \
+    ls /usr/bin/nvidia-smi /usr/bin/nvidia-ctk
+
 RUN rpm-ostree cleanup -m && \
     ostree container commit
