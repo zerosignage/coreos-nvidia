@@ -1,0 +1,18 @@
+[Unit]
+Description=Generate NVIDIA CDI specification for container runtimes
+Documentation=https://github.com/zerosignage/coreos-nvidia
+# Wait for the nvidia kernel module to bind to the GPU before we ask
+# nvidia-ctk to introspect it. ConditionPathExists keeps this unit a
+# no-op on hosts without an NVIDIA card (e.g. accidental rebase).
+After=systemd-modules-load.service local-fs.target
+ConditionPathExists=/dev/nvidia0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

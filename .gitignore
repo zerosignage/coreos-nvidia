@@ -1,0 +1,5 @@
+*.cdx.json
+*.ign
+*.iso
+*.swp
+.DS_Store
