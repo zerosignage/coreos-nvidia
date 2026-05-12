@@ -74,22 +74,72 @@ jobs:
           tags: ${{ steps.build.outputs.tags }}
           registry: ${{ env.REGISTRY }}/${{ github.repository_owner }}
 
+      # ── Cosign signing with a repository key (not keyless).
+      # Keyless (GHA OIDC + Fulcio) was the first design, but the
+      # consumer is rpm-ostree on the target hosts, through
+      # containers-policy.json(5), whose `fulcio` mode REQUIRES a
+      # `subjectEmail` — and a GitHub Actions certificate carries the
+      # workflow URL as its subject, never an email. skopeo 1.22 /
+      # containers-common 0.67 (Fedora 44) have no way to express that
+      # identity, so a keyless signature could never be verified at
+      # rebase time. A `keyPath` policy entry can.
+      #
+      # The key pair: COSIGN_PRIVATE_KEY (the encrypted cosign.key) and
+      # COSIGN_PASSWORD are repository secrets; the public half is
+      # committed in the platform repo (files/cosign/coreos-nvidia-
+      # cosign.pub) and dropped on every host by
+      # playbooks/services/install-cosign-policy.yml. Rotating the key
+      # means: new pair, both secrets, that file, and the hosts re-run.
+      #
+      # We sign the BY-DIGEST reference (not the floating :stable tag)
+      # so the signature is bound to specific image content. cosign
+      # stores the signature as a separate OCI artifact in the same
+      # registry path (tag sha256-<digest>.sig), which is what the
+      # hosts' registries.d `use-sigstore-attachments` reads. The
+      # signature is also recorded in Rekor (default), which the hosts'
+      # policy checks through rekorPublicKeyPath.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image with cosign (repository key + Rekor)
+        env:
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+          COSIGN_YES: "true"
+        run: |
+          cosign sign --key env://COSIGN_PRIVATE_KEY \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+
       - name: Image digest summary
         run: |
           {
-            echo "## Image pushed"
+            echo "## Image pushed and signed"
             echo
             echo "**Tags:** ${{ steps.push.outputs.registry-paths }}"
             echo
             echo "**Digest:** \`${{ steps.push.outputs.digest }}\`"
             echo
-            echo "### Rebase command for target host"
+            echo "**Signed by:** \`cosign\` with the repository key (public half: platform files/cosign/coreos-nvidia-cosign.pub)"
+            echo
+            echo "### Verify signature (any host with cosign and that public key):"
+            echo
+            echo '```bash'
+            echo "cosign verify --key coreos-nvidia-cosign.pub \\"
+            echo "  ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}"
+            echo '```'
+            echo
+            echo "### Rebase command for target host (unverified — bootstrap only)"
             echo
             echo '```bash'
             echo "sudo rpm-ostree rebase --bypass-driver \\"
             echo "  ostree-unverified-registry:${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}"
             echo "sudo systemctl reboot"
             echo '```'
+            echo
+            echo "With \`/etc/containers/policy.json\` installed on the target"
+            echo "(platform repo: playbooks/services/install-cosign-policy.yml), use"
+            echo "\`ostree-image-signed:docker://...\` instead of \`ostree-unverified-registry:\`"
+            echo "to get cryptographic verification at rebase time."
           } >> "$GITHUB_STEP_SUMMARY"
 
       # CRA-aligned SBOM, same pattern as build-roundcube-passwd-shim.yml
