@@ -66,18 +66,37 @@ RUN curl -fsSL -o /etc/pki/rpm-gpg/nvidia-container-toolkit.gpg \
     sed -i 's|^gpgkey=.*|gpgkey=file:///etc/pki/rpm-gpg/nvidia-container-toolkit.gpg|' \
         /etc/yum.repos.d/nvidia-container-toolkit.repo
 
-# ── 3a. Pre-install akmods + patch its root check. akmod-nvidia's
-# post-install scriptlet invokes `akmodsbuild` to compile the kernel
-# module; `akmodsbuild` refuses to run as root for desktop-safety
-# reasons. In a Containerfile build we ARE root, with no clean way
-# to drop privileges from inside an rpm-ostree post-install hook,
-# so we neutralize the check: replace every `$EUID` reference with
-# `$NOT_CHECKING_ROOT_IN_CI_BUILDS`. The replacement variable is
-# undefined, Bash expands it to empty, the `[[ "" = "0" ]]` test
-# evaluates false, the build proceeds.
-RUN rpm-ostree install akmods && \
-    sed -i 's/\$EUID/\$NOT_CHECKING_ROOT_IN_CI_BUILDS/g' /usr/sbin/akmodsbuild && \
-    grep NOT_CHECKING_ROOT_IN_CI_BUILDS /usr/sbin/akmodsbuild | head -1
+# ── 3a. Pre-install akmods. akmod-nvidia's post-install scriptlet
+# invokes `akmodsbuild` to compile the kernel module; `akmodsbuild`
+# refuses to run as root for desktop-safety reasons. In a Containerfile
+# build we ARE root with no clean privilege-drop path. Installing akmods
+# alone (no kmod source yet) doesn't trigger any build, but does place
+# /usr/sbin/akmodsbuild on disk for the next step to patch.
+RUN rpm-ostree install akmods
+
+# ── 3b. Print akmodsbuild's pre-patch content so we can see what the
+# root check actually looks like in the version we got. Surfaces in
+# the GHA log for forensics.
+RUN echo "=== akmodsbuild head (BEFORE patch) ===" && \
+    head -25 /usr/sbin/akmodsbuild && \
+    echo "=== grep EUID + root in akmodsbuild (BEFORE) ===" && \
+    grep -nE 'EUID|Not to be used as root|exit 1' /usr/sbin/akmodsbuild || echo "(no matches)"
+
+# ── 3c. Replace the entire `if ... EUID ... ]]` line with `if false`.
+# Preserves bash syntax (the then-block becomes unreachable instead
+# of orphaned) and is robust to whitespace/operator variations in the
+# original check.
+RUN sed -i 's|^if \[\[.*EUID.*\]\]|if false # EUID root check disabled for CI build|' \
+        /usr/sbin/akmodsbuild
+
+# ── 3d. Verify the patch landed. If grep finds 0 matches, fail loud
+# so the operator sees it. The grep also surfaces the patched content
+# in the build log for confirmation.
+RUN echo "=== akmodsbuild head (AFTER patch) ===" && \
+    head -25 /usr/sbin/akmodsbuild && \
+    echo "=== grep 'disabled for CI' in akmodsbuild (AFTER) ===" && \
+    grep -n 'disabled for CI build' /usr/sbin/akmodsbuild || \
+        { echo "FATAL: sed patch did not match. EUID check is in a form the sed didn't anticipate."; exit 1; }
 
 # ── 4. Layer the NVIDIA stack + k3s-selinux + ansible-side essentials.
 # akmod-nvidia's post-install scriptlet now succeeds because the
