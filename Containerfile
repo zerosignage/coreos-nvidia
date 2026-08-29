@@ -47,13 +47,22 @@ RUN dnf install -y \
 # Both enabled covers either case.
 RUN dnf install -y fedora-repos-archive
 
-# Install kernel-devel WITHOUT a version pin. dnf picks the latest
-# version across enabled repos (updates + updates-archive). We
-# record what it resolved to so stage 2 can override-replace FCOS
-# to the same NVR.
-RUN dnf install -y --enablerepo=updates-archive \
+# Pin kernel-devel to the LATEST VERSION IN updates-archive --
+# the same repo stage 2's `override replace --from
+# repo=updates-archive` pulls from. Resolving "latest across all
+# repos" instead let stage 1 pick a newer kernel from `updates`
+# (e.g. 7.1.10) than stage 2 could get from updates-archive
+# (7.1.9), so the stage-2 sanity check aborted every build once
+# the two repos skewed. Pinning to one repo makes the two stages
+# agree by construction.
+RUN KVER=$(dnf repoquery --disablerepo='*' --enablerepo=updates-archive \
+        --latest-limit=1 --qf '%{VERSION}-%{RELEASE}.%{ARCH}' kernel-core \
+        | tail -1) && \
+    test -n "$KVER" && \
+    echo "Pinning kernel to updates-archive latest: $KVER" && \
+    dnf install -y --enablerepo=updates-archive \
         akmods \
-        kernel-devel \
+        kernel-devel-$KVER \
         kernel-headers \
         xorg-x11-drv-nvidia-kmodsrc \
         gcc make rpm-build
