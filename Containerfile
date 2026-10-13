@@ -191,6 +191,43 @@ RUN systemctl enable zsig-nvidia-cdi.service
 # device nodes exist before any userspace tool tries to open them.
 RUN systemctl enable nvidia-persistenced.service
 
+# Build toolchain for the jobs r1 runs on the host (openmixer lane
+# hand-backs: pipewire-native's node-gyp build, omx-dsp from source,
+# the native DSP tier). FCOS ships no compiler, and layering one on a
+# deployed node fails once its base glibc/libstdc++ age out of the
+# Fedora repos, so the toolchain lives in the image.
+#
+# The audinux COPR stays enabled in the image: it carries the noarch
+# clap-devel-1.2.10 (Fedora ships only 1.2.7), and openmixer's
+# clap-prefix.sh downloads that rpm from the repo by name.
+RUN curl -fsSL -o /etc/pki/rpm-gpg/copr-ycollet-audinux.gpg \
+        https://download.copr.fedorainfracloud.org/results/ycollet/audinux/pubkey.gpg && \
+    rpm --import /etc/pki/rpm-gpg/copr-ycollet-audinux.gpg && \
+    printf '%s\n' \
+        '[copr-ycollet-audinux]' \
+        'name=Copr repo for audinux owned by ycollet' \
+        'baseurl=https://download.copr.fedorainfracloud.org/results/ycollet/audinux/fedora-$releasever-$basearch/' \
+        'type=rpm-md' \
+        'gpgcheck=1' \
+        'gpgkey=file:///etc/pki/rpm-gpg/copr-ycollet-audinux.gpg' \
+        'repo_gpgcheck=0' \
+        'enabled=1' \
+        > /etc/yum.repos.d/copr-ycollet-audinux.repo
+
+# dnf, not rpm-ostree: the FCOS base carries glibc and libstdc++
+# builds the Fedora repos no longer hold, so gcc's exact-version
+# requires only resolve when the same transaction may upgrade them.
+RUN dnf -y install --setopt=install_weak_deps=False \
+        gcc gcc-c++ make pkgconf-pkg-config meson ninja-build \
+        pipewire-devel lv2-devel lilv-devel \
+        clap-devel-1.2.10 && \
+    dnf clean all
+
+RUN echo "=== build toolchain ===" && \
+    gcc --version | head -1 && g++ --version | head -1 && \
+    meson --version && ninja --version && \
+    pkg-config --modversion libpipewire-0.3 lv2 lilv-0 clap
+
 # Smoke check + OSTree finalize.
 RUN echo "=== kernel modules in place ===" && \
     ls /lib/modules/*/extra/nvidia/ | head -5 && \
