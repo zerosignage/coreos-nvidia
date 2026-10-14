@@ -17,12 +17,33 @@ Image: **`ghcr.io/zerosignage/coreos-nvidia`**
 | `k3s-selinux` | k3s-io GitHub releases | Allow rules for k3s on SELinux-enforcing FCOS |
 | `python3-kubernetes` | Fedora `updates` | Required by the platform repo's k8s ansible modules |
 
-## Tags
+## Artifacts published per build
+
+Each successful build publishes **three** things:
+
+| Artifact | Where | URL pattern |
+|---|---|---|
+| OCI image (floating + pinned) | GHCR | `ghcr.io/zerosignage/coreos-nvidia:stable` / `:stable-<full-sha>` |
+| Pre-compiled kmod RPM | GitHub Release | `https://github.com/zerosignage/coreos-nvidia/releases/download/build-<short-sha>/kmod-nvidia-*.rpm` |
+| CycloneDX SBOM (CRA) | GitHub Release | `https://github.com/zerosignage/coreos-nvidia/releases/download/build-<short-sha>/sbom-coreos-nvidia-*.cdx.json` |
+
+The release page is also the canonical "what was in this build" reference:
+`https://github.com/zerosignage/coreos-nvidia/releases/tag/build-<short-sha>`.
+
+### OCI image tags
 
 | Tag | Meaning |
 |---|---|
 | `stable` | Latest successful build from `main`. Floating — moves on each successful build. |
-| `stable-<sha>` | Immutable tag for a specific commit. Use this when pinning a host. |
+| `stable-<full-sha>` | Immutable tag for a specific commit. Use this when pinning a host. |
+
+### Why the kmod RPM is published separately
+
+The kmod RPM is built once per Containerfile change (stage 1 of the multi-stage build) and consumed by the final FCOS image (stage 2). Publishing it independently:
+
+- Lets other on-prem FCOS hosts install the same kmod without rebasing to the whole image (e.g. for development workstations that already have a different OSTree origin)
+- Provides a reproducibility audit trail — the exact `.src.rpm` is also attached so anyone can rebuild from source
+- Decouples the kmod-build vs FCOS-image-build cadences if we ever want to ship them on different schedules
 
 ## Deploying to a target host
 
