@@ -228,6 +228,30 @@ RUN echo "=== build toolchain ===" && \
     meson --version && ninja --version && \
     pkg-config --modversion libpipewire-0.3 lv2 lilv-0 clap
 
+# OpenMixer's own build requirements, for the console builds and
+# suites r1 runs on the host (the declarations generator reads the
+# installed plugin-hostd-protocol; the engine links omx-dsp and the
+# CLAP core). The release package brings the repository and its key;
+# the baseurl follows $releasever, so the same lines hold when the
+# base moves to the next Fedora. Named by pkgconfig module, the way
+# the console's spec names them, so a package rename does not break
+# the build. The weekly rebuild picks up the channel's newest.
+RUN dnf -y install --setopt=install_weak_deps=False \
+        https://www.openmixer.org/rpm/openmixer-release.noarch.rpm && \
+    dnf -y install --setopt=install_weak_deps=False \
+        'pkgconfig(omx-contract)' 'pkgconfig(omxdsp)' \
+        'pkgconfig(omxplugins)' 'pkgconfig(omx-clap-core)' \
+        'pkgconfig(omx-clap-lv2)' 'pkgconfig(plugin-hostd)' \
+        'pkgconfig(plugin-hostd-protocol)' \
+        'pkgconfig(mod-host-protocol)' mod-host && \
+    dnf clean all
+
+RUN echo "=== OpenMixer build requirements ===" && \
+    for m in omx-contract omxdsp omxplugins omx-clap-core omx-clap-lv2 \
+             plugin-hostd plugin-hostd-protocol mod-host-protocol; do \
+        printf '%s %s\n' "$m" "$(pkg-config --modversion "$m")" || exit 1 ; \
+    done
+
 # Smoke check + OSTree finalize.
 RUN echo "=== kernel modules in place ===" && \
     ls /lib/modules/*/extra/nvidia/ | head -5 && \
