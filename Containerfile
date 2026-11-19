@@ -1,6 +1,6 @@
 # Two-stage build with dynamic kernel resolution:
 #
-# Stage 1 ("kmod-builder"): regular Fedora 44 image. Install
+# Stage 1 ("kmod-builder"): regular Fedora image (${FEDORA}). Install
 # kernel-devel WITHOUT a version pin — let dnf pick whatever the
 # latest available release is in updates / updates-archive. Record
 # the resolved NVR to /home/builder/kernel-uname-r. Build kmod
@@ -33,13 +33,22 @@
 #     the kmod against that. This is what the original Containerfile
 #     did with a hardcoded `-300`; we just dynamize the choice.
 
+# The Fedora release of the kmod builder MUST equal the FCOS base's, or the
+# kmod is built for a kernel the image does not carry. The workflow reads it
+# from the base image's version label and passes it in, so the image follows
+# the stream (stable moving to F45) with no edit here.
+ARG FCOS_STREAM=stable
+ARG FEDORA=44
+
 # ── Stage 1: install latest available kernel-devel + build kmod ──
-FROM fedora:44 AS kmod-builder
+FROM fedora:${FEDORA} AS kmod-builder
+
+ARG FEDORA
 
 # RPMFusion repos for the nvidia kmod source RPM.
 RUN dnf install -y \
-        https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-44.noarch.rpm \
-        https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-44.noarch.rpm
+        https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-${FEDORA}.noarch.rpm \
+        https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-${FEDORA}.noarch.rpm
 
 # Enable Fedora's updates-archive repo. The latest available
 # kernel-devel for fc44 may sit in `updates` (fresh) OR in
@@ -107,7 +116,7 @@ RUN ls -la /home/builder/ && \
     rpm -qpR /home/builder/kmod-nvidia-*.rpm
 
 # ── Stage 2: real FCOS image ──────────────────────────────────
-FROM quay.io/fedora/fedora-coreos:stable
+FROM quay.io/fedora/fedora-coreos:${FCOS_STREAM}
 
 ARG K3S_SELINUX_TAG=v1.6.stable.1
 ARG K3S_SELINUX_RPM=k3s-selinux-1.6-1.coreos.noarch.rpm
