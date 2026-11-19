@@ -1,6 +1,6 @@
 # Two-stage build with dynamic kernel resolution:
 #
-# Stage 1 ("kmod-builder"): regular Fedora 44 image. Install
+# Stage 1 ("kmod-builder"): regular Fedora image (${FEDORA_VERSION}). Install
 # kernel-devel WITHOUT a version pin — let dnf pick whatever the
 # latest available release is in updates / updates-archive. Record
 # the resolved NVR to /home/builder/kernel-uname-r. Build kmod
@@ -33,13 +33,23 @@
 #     the kmod against that. This is what the original Containerfile
 #     did with a hardcoded `-300`; we just dynamize the choice.
 
+# The Fedora release of the kmod builder MUST equal the FCOS base's, or the
+# kmod is built for a kernel the image does not carry. The workflow reads it
+# from the base image's version label and passes it in, so the image follows
+# the stream (stable moving to F45) with no edit here. No default: an empty
+# value is refused below.
+ARG FEDORA_VERSION
+
 # ── Stage 1: install latest available kernel-devel + build kmod ──
-FROM fedora:44 AS kmod-builder
+FROM fedora:${FEDORA_VERSION} AS kmod-builder
+
+ARG FEDORA_VERSION
+RUN test -n "${FEDORA_VERSION}" || { echo 'FEDORA_VERSION is empty: pass --build-arg' >&2; exit 1; }
 
 # RPMFusion repos for the nvidia kmod source RPM.
 RUN dnf install -y \
-        https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-44.noarch.rpm \
-        https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-44.noarch.rpm
+        https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-${FEDORA_VERSION}.noarch.rpm \
+        https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-${FEDORA_VERSION}.noarch.rpm
 
 # Enable Fedora's updates-archive repo. The latest available
 # kernel-devel for fc44 may sit in `updates` (fresh) OR in
