@@ -20,10 +20,6 @@ on:
   schedule:
     - cron: '0 2 * * 1'
   workflow_dispatch:
-    inputs:
-      stream:
-        description: 'FCOS stream to build on (anything but stable builds only, no push)'
-        default: stable
   pull_request:
     paths:
       - 'Containerfile'
@@ -56,7 +52,7 @@ jobs:
           df -h
 
       - name: Login to GHCR
-        if: github.event_name != 'pull_request' && steps.base.outputs.stream == 'stable'
+        if: github.event_name != 'pull_request'
         uses: redhat-actions/podman-login@v1
         with:
           registry: ${{ env.REGISTRY }}
@@ -66,12 +62,12 @@ jobs:
       - name: Resolve the FCOS base's Fedora release
         id: base
         run: |
-          stream="${{ inputs.stream || 'stable' }}"
-          ver=$(skopeo inspect docker://quay.io/fedora/fedora-coreos:"$stream" | jq -r '.Labels.version')
+          set -euo pipefail
+          ver=$(skopeo inspect --override-os linux --override-arch amd64 \
+            docker://quay.io/fedora/fedora-coreos:stable | jq -r '.Labels.version')
           test -n "$ver" && test "$ver" != null
-          echo "stream=$stream" >> "$GITHUB_OUTPUT"
           echo "fedora=${ver%%.*}" >> "$GITHUB_OUTPUT"
-          echo "FCOS $stream is $ver"
+          echo "FCOS stable is $ver"
 
       - name: Build OCI image
         id: build
@@ -84,14 +80,13 @@ jobs:
           containerfiles: ./Containerfile
           oci: true
           build-args: |
-            FCOS_STREAM=${{ steps.base.outputs.stream }}
-            FEDORA=${{ steps.base.outputs.fedora }}
+            FEDORA_VERSION=${{ steps.base.outputs.fedora }}
           extra-args: |
             --device /dev/fuse
             --security-opt label=disable
 
       - name: Push to GHCR
-        if: github.event_name != 'pull_request' && steps.base.outputs.stream == 'stable'
+        if: github.event_name != 'pull_request'
         id: push
         uses: redhat-actions/push-to-registry@v2
         with:
@@ -124,11 +119,11 @@ jobs:
       # signature is also recorded in Rekor (default), which the hosts'
       # policy checks through rekorPublicKeyPath.
       - name: Install cosign
-        if: github.event_name != 'pull_request' && steps.base.outputs.stream == 'stable'
+        if: github.event_name != 'pull_request'
         uses: sigstore/cosign-installer@v3
 
       - name: Sign image with cosign (repository key + Rekor)
-        if: github.event_name != 'pull_request' && steps.base.outputs.stream == 'stable'
+        if: github.event_name != 'pull_request'
         env:
           COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
@@ -138,7 +133,7 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
 
       - name: Image digest summary
-        if: github.event_name != 'pull_request' && steps.base.outputs.stream == 'stable'
+        if: github.event_name != 'pull_request'
         run: |
           {
             echo "## Image pushed and signed"
@@ -173,7 +168,7 @@ jobs:
       # CRA-aligned SBOM, same pattern as build-roundcube-passwd-shim.yml
       # in the platform repo. CycloneDX format, 90-day retention.
       - name: Generate SBOM (CycloneDX)
-        if: github.event_name != 'pull_request' && steps.base.outputs.stream == 'stable'
+        if: github.event_name != 'pull_request'
         uses: anchore/sbom-action@v0
         with:
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:stable-${{ github.sha }}
