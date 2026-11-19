@@ -64,7 +64,7 @@ jobs:
         run: |
           set -euo pipefail
           ver=$(skopeo inspect --override-os linux --override-arch amd64 \
-            docker://quay.io/fedora/fedora-coreos:stable | jq -r '.Labels.version')
+            docker://quay.io/fedora/fedora-coreos:stable | jq -r '.Labels["org.opencontainers.image.version"]')
           test -n "$ver" && test "$ver" != null
           echo "fedora=${ver%%.*}" >> "$GITHUB_OUTPUT"
           echo "FCOS stable is $ver"
