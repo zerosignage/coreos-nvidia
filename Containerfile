@@ -257,5 +257,10 @@ RUN echo "=== kernel modules in place ===" && \
     echo "=== nvidia userspace tools ===" && \
     ls /usr/bin/nvidia-smi /usr/bin/nvidia-ctk
 
+# `ostree container commit` is deprecated and now refuses to run in
+# a container build ("Not in an ostree-based container environment");
+# `bootc container lint` is its replacement and fails the build on a
+# image that cannot boot as a bootc/ostree container.
 RUN dnf clean all && \
-    ostree container commit
+    rm -rf /var/cache/* /var/log/dnf* /var/log/hawkey.log /tmp/* && \
+    bootc container lint
