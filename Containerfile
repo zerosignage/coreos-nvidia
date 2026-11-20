@@ -155,7 +155,7 @@ RUN dnf -y install fedora-repos-archive && \
         -f "/usr/lib/modules/$KVER/initramfs.img" && \
     dnf clean all
 
-# Sanity: confirm the kernel rpm-ostree installed matches what
+# Sanity: confirm the kernel dnf installed matches what
 # stage 1 built kmod against. If they diverge (e.g. repo rolled
 # between stages — vanishingly unlikely but possible), the
 # subsequent install would fail with a depsolve error and produce
@@ -170,7 +170,7 @@ RUN EXPECTED=$(cat /tmp/kernel-uname-r) && \
         echo "kmod ↔ FCOS kernel version match: $EXPECTED" ; \
     fi
 
-RUN rpm-ostree install \
+RUN dnf -y install \
         https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm \
         https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm
 
@@ -190,7 +190,7 @@ RUN curl -fsSL -o /etc/pki/rpm-gpg/nvidia-container-toolkit.gpg \
 # xorg-x11-drv-nvidia-cuda) + userspace driver + container toolkit
 # + k3s-selinux + ansible essentials.
 RUN ls /var/tmp/rpms/ && \
-    rpm-ostree install \
+    dnf -y install \
         /var/tmp/rpms/kmod-nvidia-*.rpm \
         xorg-x11-drv-nvidia-cuda \
         nvidia-container-toolkit \
@@ -257,5 +257,5 @@ RUN echo "=== kernel modules in place ===" && \
     echo "=== nvidia userspace tools ===" && \
     ls /usr/bin/nvidia-smi /usr/bin/nvidia-ctk
 
-RUN rpm-ostree cleanup -m && \
+RUN dnf clean all && \
     ostree container commit
