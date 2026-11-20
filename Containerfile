@@ -153,7 +153,11 @@ RUN dnf -y install fedora-repos-archive && \
     mkdir -p /var/roothome && \
     dracut --no-hostonly --kver "$KVER" --reproducible --zstd --add ostree \
         -f "/usr/lib/modules/$KVER/initramfs.img" && \
-    dnf clean all
+    dnf clean all && \
+    test "$(ls /usr/lib/modules)" = "$KVER" && \
+    test -f "/usr/lib/modules/$KVER/vmlinuz" && \
+    test -s "/usr/lib/modules/$KVER/initramfs.img" || \
+    { echo "ABORT: /usr/lib/modules must hold exactly $KVER with vmlinuz and initramfs.img; has: $(ls /usr/lib/modules)" >&2; exit 1; }
 
 # Sanity: confirm the kernel dnf installed matches what
 # stage 1 built kmod against. If they diverge (e.g. repo rolled
@@ -262,5 +266,6 @@ RUN echo "=== kernel modules in place ===" && \
 # `bootc container lint` is its replacement and fails the build on a
 # image that cannot boot as a bootc/ostree container.
 RUN dnf clean all && \
-    rm -rf /var/cache/* /var/log/dnf* /var/log/hawkey.log /tmp/* && \
-    bootc container lint
+    rm -rf /var/cache/* /var/log/dnf* /var/log/hawkey.log /tmp/* \
+        /boot/* /run/dnf /var/lib/dnf /var/lib/rpm-state/kernel && \
+    bootc container lint --fatal-warnings
