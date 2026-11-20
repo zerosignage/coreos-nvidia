@@ -39,6 +39,9 @@
 # the stream (stable moving to F45) with no edit here. No default: an empty
 # value is refused below.
 ARG FEDORA_VERSION
+# The FCOS stream the final image is based on (stable or next); the workflow
+# passes it with FEDORA_VERSION read from that same stream's version label.
+ARG FCOS_STREAM=stable
 
 # ── Stage 1: install latest available kernel-devel + build kmod ──
 FROM fedora:${FEDORA_VERSION} AS kmod-builder
@@ -117,7 +120,7 @@ RUN ls -la /home/builder/ && \
     rpm -qpR /home/builder/kmod-nvidia-*.rpm
 
 # ── Stage 2: real FCOS image ──────────────────────────────────
-FROM quay.io/fedora/fedora-coreos:stable
+FROM quay.io/fedora/fedora-coreos:${FCOS_STREAM}
 
 ARG K3S_SELINUX_TAG=v1.6.stable.1
 ARG K3S_SELINUX_RPM=k3s-selinux-1.6-1.coreos.noarch.rpm

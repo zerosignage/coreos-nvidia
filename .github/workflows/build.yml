@@ -33,6 +33,12 @@ env:
 
 jobs:
   build:
+    name: build (${{ matrix.stream }})
+    strategy:
+      # Independent streams: a next failure must not cancel stable.
+      fail-fast: false
+      matrix:
+        stream: [stable, next]
     # Pinned: ubuntu-latest rolled to a newer image whose kernel broke
     # rpm-ostree's scriptlet sandbox ("Undoing prep filesystem for
     # scripts: Invalid argument"). Last green build was on 24.04.
@@ -64,10 +70,10 @@ jobs:
         run: |
           set -euo pipefail
           ver=$(skopeo inspect --override-os linux --override-arch amd64 \
-            docker://quay.io/fedora/fedora-coreos:stable | jq -r '.Labels["org.opencontainers.image.version"]')
+            docker://quay.io/fedora/fedora-coreos:${{ matrix.stream }} | jq -r '.Labels["org.opencontainers.image.version"]')
           test -n "$ver" && test "$ver" != null
           echo "fedora=${ver%%.*}" >> "$GITHUB_OUTPUT"
-          echo "FCOS stable is $ver"
+          echo "FCOS ${{ matrix.stream }} is $ver"
 
       - name: Build OCI image
         id: build
@@ -75,12 +81,13 @@ jobs:
         with:
           image: coreos-nvidia
           tags: |
-            stable-${{ github.sha }}
-            stable
+            ${{ matrix.stream }}-${{ github.sha }}
+            ${{ matrix.stream }}
           containerfiles: ./Containerfile
           oci: true
           build-args: |
             FEDORA_VERSION=${{ steps.base.outputs.fedora }}
+            FCOS_STREAM=${{ matrix.stream }}
           extra-args: |
             --device /dev/fuse
             --security-opt label=disable
@@ -171,8 +178,8 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: anchore/sbom-action@v0
         with:
-          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:stable-${{ github.sha }}
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ matrix.stream }}-${{ github.sha }}
           format: cyclonedx-json
-          output-file: sbom-coreos-nvidia-${{ github.sha }}.cdx.json
+          output-file: sbom-coreos-nvidia-${{ matrix.stream }}-${{ github.sha }}.cdx.json
           upload-artifact: true
           upload-artifact-retention: 90
