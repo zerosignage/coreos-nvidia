@@ -267,5 +267,7 @@ RUN echo "=== kernel modules in place ===" && \
 # image that cannot boot as a bootc/ostree container.
 RUN dnf clean all && \
     rm -rf /var/cache/* /var/log/dnf* /var/log/hawkey.log /tmp/* \
-        /boot/* /run/dnf /var/lib/dnf /var/lib/rpm-state/kernel && \
+        /boot/* /run/dnf /var/lib/dnf /var/lib/rpm-state/kernel /var/tmp/rpms && \
+    echo 'd /var/lib/geoclue 0755 geoclue geoclue - -' \
+        > /usr/lib/tmpfiles.d/zsig-geoclue-state.conf && \
     bootc container lint --fatal-warnings
