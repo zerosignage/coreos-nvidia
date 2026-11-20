@@ -8,13 +8,11 @@
 # so stage 2 can read it back.
 #
 # Stage 2 (final FCOS image): COPY both the kmod RPM and the
-# kernel-uname-r record. Use `rpm-ostree override replace
-# --from repo=updates-archive kernel kernel-core kernel-modules
-# kernel-modules-core` — rpm-ostree picks the LATEST available in
-# the repo, which is the same version dnf picked in stage 1 (both
-# stages run within seconds of each other against the same
-# repo metadata snapshot). The verify step at the end asserts the
-# installed kernel NVR matches what stage 1 built against.
+# kernel-uname-r record. Use `dnf install` of exactly the NVR
+# stage 1 recorded (from updates-archive) for kernel, kernel-core,
+# kernel-modules and kernel-modules-core, then rebuild the
+# initramfs. A check asserts the installed kernel NVR matches what
+# stage 1 built against.
 #
 # Why this design beats hardcoded pins:
 #   - When Fedora's archive rolls (older releases age out, newer
@@ -28,7 +26,7 @@
 #     CoreOS-internal). Fedora's main + updates + updates-archive
 #     repos only have `-200` / `-300` releases (Fedora-mainline
 #     builds). So `kernel-devel-${V}-101.fc44` is unavailable to
-#     build a matching kmod. Hence we always override-replace
+#     build a matching kmod. Hence we always replace
 #     FCOS's `-101` kernel to a Fedora-mainline release and build
 #     the kmod against that. This is what the original Containerfile
 #     did with a hardcoded `-300`; we just dynamize the choice.
@@ -61,8 +59,7 @@ RUN dnf install -y \
 RUN dnf install -y fedora-repos-archive
 
 # Pin kernel-devel to the LATEST VERSION IN updates-archive --
-# the same repo stage 2's `override replace --from
-# repo=updates-archive` pulls from. Resolving "latest across all
+# the repo stage 2 installs the kernel from. Resolving "latest across all
 # repos" instead let stage 1 pick a newer kernel from `updates`
 # (e.g. 7.1.10) than stage 2 could get from updates-archive
 # (7.1.9), so the stage-2 sanity check aborted every build once
@@ -81,8 +78,8 @@ RUN KVER=$(dnf repoquery --disablerepo='*' --enablerepo=updates-archive \
         gcc make rpm-build
 
 # Capture the exact kernel-devel NVR dnf actually installed. This
-# is the version stage 2 will need to override-replace FCOS's
-# kernel to.
+# is the version stage 2 will install in place of FCOS's
+# kernel.
 RUN rpm -q kernel-devel --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' \
         > /tmp/kernel-uname-r && \
     echo "Resolved kernel-devel: $(cat /tmp/kernel-uname-r)"
@@ -130,20 +127,33 @@ LABEL org.opencontainers.image.licenses="Apache-2.0"
 LABEL ostree.bootable="true"
 
 # Bring in the kernel-uname-r record from stage 1 + the produced
-# kmod RPM. We do the override-replace FIRST so the rest of the
+# kmod RPM. We do the kernel swap FIRST so the rest of the
 # install picks up against the new kernel.
 COPY --from=kmod-builder /home/builder/kernel-uname-r /tmp/kernel-uname-r
 COPY --from=kmod-builder /home/builder/kmod-nvidia-*.rpm /var/tmp/rpms/
 
-# Override-replace FCOS's CoreOS-internal `-101` kernel with the
-# Fedora-mainline release that stage 1 built against. `--from
-# repo=updates-archive` picks the latest available in the repo,
-# which should be the same version stage 1 resolved a few seconds
-# earlier (same repo snapshot). The sanity check below verifies.
-RUN rpm-ostree override replace \
-        --experimental \
-        --from repo=updates-archive \
-        kernel kernel-core kernel-modules kernel-modules-core
+# Swap FCOS's kernel for the Fedora-mainline release stage 1 built
+# against. `rpm-ostree override replace` is not usable here: inside a
+# container build the system was not booted via libostree and it
+# refuses to run. dnf is on the FCOS image and replaces the four
+# kernel packages in one transaction, so the old ones leave with it.
+#   - the NVR is the one stage 1 recorded, not "latest": no skew;
+#   - KERNEL_INSTALL_BYPASS=1 stops the kernel packages' scriptlets
+#     from running kernel-install (which would write to /boot);
+#   - the old /usr/lib/modules/<kver> directory keeps files no
+#     package owns (its initramfs), so it is removed;
+#   - FCOS builds the initramfs when it composes the image, so
+#     here dracut makes the one the new kernel needs.
+RUN dnf -y install fedora-repos-archive && \
+    KVER=$(cat /tmp/kernel-uname-r) && \
+    OLD=$(rpm -q kernel-core --qf '%{VERSION}-%{RELEASE}.%{ARCH}') && \
+    KERNEL_INSTALL_BYPASS=1 dnf -y --enablerepo=updates-archive install \
+        kernel-$KVER kernel-core-$KVER kernel-modules-$KVER kernel-modules-core-$KVER && \
+    if [ "$OLD" != "$KVER" ]; then rm -rf "/usr/lib/modules/$OLD"; fi && \
+    mkdir -p /var/roothome && \
+    dracut --no-hostonly --kver "$KVER" --reproducible --zstd --add ostree \
+        -f "/usr/lib/modules/$KVER/initramfs.img" && \
+    dnf clean all
 
 # Sanity: confirm the kernel rpm-ostree installed matches what
 # stage 1 built kmod against. If they diverge (e.g. repo rolled
